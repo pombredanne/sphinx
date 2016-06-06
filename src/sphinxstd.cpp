@@ -100,7 +100,7 @@ void * sphDebugNew ( size_t iSize, const char * sFile, int iLine, bool bArray )
 {
 	BYTE * pBlock = (BYTE*) ::malloc ( iSize+sizeof(CSphMemHeader)+sizeof(DWORD) );
 	if ( !pBlock )
-		sphDie ( "out of memory (unable to allocate "UINT64_FMT" bytes)", (uint64_t)iSize ); // FIXME! this may fail with malloc error too
+		sphDie ( "out of memory (unable to allocate " UINT64_FMT " bytes)", (uint64_t)iSize ); // FIXME! this may fail with malloc error too
 
 	*(DWORD*)( pBlock+iSize+sizeof(CSphMemHeader) ) = MEMORY_MAGIC_END;
 	g_tAllocsMutex.Lock();
@@ -278,7 +278,7 @@ void sphAllocsDump ( int iFile, int iSinceID )
 
 void sphAllocsStats ()
 {
-	fprintf ( stdout, "--- total-allocs=%d, peak-allocs=%d, peak-bytes="INT64_FMT"\n",
+	fprintf ( stdout, "--- total-allocs=%d, peak-allocs=%d, peak-bytes=" INT64_FMT "\n",
 		g_iTotalAllocs, g_iPeakAllocs, g_iPeakBytes );
 }
 
@@ -427,7 +427,7 @@ void sphDebugDelete ( void * pPtr )
 void sphAllocsStats ()
 {
 	g_tAllocsMutex.Lock ();
-	fprintf ( stdout, "--- total-allocs=%d, peak-allocs=%d, peak-bytes="INT64_FMT"\n",
+	fprintf ( stdout, "--- total-allocs=%d, peak-allocs=%d, peak-bytes=" INT64_FMT "\n",
 		g_iTotalAllocs, g_iPeakAllocs, g_iPeakBytes );
 	g_tAllocsMutex.Unlock ();
 }
@@ -630,7 +630,7 @@ void * operator new ( size_t iSize )
 {
 	void * pResult = ::malloc ( iSize );
 	if ( !pResult )
-		sphDieRestart ( "out of memory (unable to allocate "UINT64_FMT" bytes)", (uint64_t)iSize ); // FIXME! this may fail with malloc error too
+		sphDieRestart ( "out of memory (unable to allocate " UINT64_FMT " bytes)", (uint64_t)iSize ); // FIXME! this may fail with malloc error too
 	return pResult;
 }
 
@@ -639,7 +639,7 @@ void * operator new [] ( size_t iSize )
 {
 	void * pResult = ::malloc ( iSize );
 	if ( !pResult )
-		sphDieRestart ( "out of memory (unable to allocate "UINT64_FMT" bytes)", (uint64_t)iSize ); // FIXME! this may fail with malloc error too
+		sphDieRestart ( "out of memory (unable to allocate " UINT64_FMT " bytes)", (uint64_t)iSize ); // FIXME! this may fail with malloc error too
 	return pResult;
 }
 
@@ -1351,7 +1351,7 @@ CSphRwlock::CSphRwlock ()
 {}
 
 
-bool CSphRwlock::Init ()
+bool CSphRwlock::Init ( bool )
 {
 	assert ( !m_bInitialized );
 	assert ( !m_hWriteMutex && !m_hReadEvent && !m_iReaders );
@@ -1469,11 +1469,37 @@ CSphRwlock::CSphRwlock ()
 	: m_bInitialized ( false )
 {}
 
-bool CSphRwlock::Init ()
+bool CSphRwlock::Init ( bool bPreferWriter )
 {
 	assert ( !m_bInitialized );
 
-	m_bInitialized = ( pthread_rwlock_init ( &m_tLock, NULL )==0 );
+	pthread_rwlockattr_t tAttr;
+	pthread_rwlockattr_t * pAttr = NULL;
+
+	while ( bPreferWriter )
+	{
+		bool bOk = ( pthread_rwlockattr_init ( &tAttr )==0 );
+		assert ( bOk );
+		if ( !bOk )
+			break;
+
+		bOk = ( pthread_rwlockattr_setkind_np ( &tAttr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP )==0 );
+		assert ( bOk );
+		if ( !bOk )
+		{
+			pthread_rwlockattr_destroy ( &tAttr );
+			break;
+		}
+
+		pAttr = &tAttr;
+		break;
+	}
+
+	m_bInitialized = ( pthread_rwlock_init ( &m_tLock, pAttr )==0 );
+
+	if ( pAttr )
+		pthread_rwlockattr_destroy ( &tAttr );
+
 	return m_bInitialized;
 }
 

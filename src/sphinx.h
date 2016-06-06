@@ -29,6 +29,7 @@
 	#define USE_RLP			0	/// whether to compile RLP support
 	#define USE_WINDOWS		1	/// whether to compile for Windows
 	#define USE_SYSLOG		0	/// whether to use syslog for logging
+	#define HAVE_STRNLEN	1	
 
 	#define UNALIGNED_RAM_ACCESS	1
 	#define USE_LITTLE_ENDIAN		1
@@ -193,13 +194,24 @@ inline const	DWORD *	STATIC2DOCINFO ( const DWORD * pAttrs )	{ return STATIC2DOC
 
 /////////////////////////////////////////////////////////////////////////////
 
-#include "sphinxversion.h"
+#ifdef BUILD_WITH_CMAKE
+	#include "gen_sphinxversion.h"
+#else
+	#include "sphinxversion.h"
+#endif
 
 #ifndef SPHINX_TAG
 #define SPHINX_TAG "-dev"
 #endif
 
-#define SPHINX_VERSION			"2.3.2" SPHINX_BITS_TAG SPHINX_TAG " (" SPH_GIT_COMMIT_ID ")"
+#ifndef SPH_SVN_TAGREV
+#define SPH_SVN_TAGREV "unknown"
+#endif
+
+// below is for easier extraction of the ver. by any external scripts
+#define SPHINX_VERSION_NUMBERS    "2.3.2"
+
+#define SPHINX_VERSION           SPHINX_VERSION_NUMBERS SPHINX_BITS_TAG SPHINX_TAG " (" SPH_GIT_COMMIT_ID ")"
 #define SPHINX_BANNER			"Sphinx " SPHINX_VERSION "\nCopyright (c) 2001-2015, Andrew Aksyonoff\nCopyright (c) 2008-2015, Sphinx Technologies Inc (http://sphinxsearch.com)\n\n"
 #define SPHINX_SEARCHD_PROTO	1
 #define SPHINX_CLIENT_VERSION	1
@@ -258,12 +270,6 @@ void			sphInterruptNow();
 
 /// check if we got interrupted
 bool			sphInterrupted();
-
-#if !USE_WINDOWS
-/// set process info
-void			sphSetProcessInfo ( bool bHead );
-#endif
-
 
 /// initialize IO statistics collecting
 bool			sphInitIOStats ();
@@ -2712,6 +2718,7 @@ public:
 	bool			m_bIgnoreNonexistent; ///< whether to warning or not about non-existent columns in select list
 	bool			m_bIgnoreNonexistentIndexes; ///< whether to error or not about non-existent indexes in index list
 	bool			m_bStrict;			///< whether to warning or not about incompatible types
+	bool			m_bSync;			///< whether or not use synchronous operations (optimize, etc.)
 
 	ISphTableFunc *	m_pTableFunc;		///< post-query NOT OWNED, WILL NOT BE FREED in dtor.
 	CSphFilterSettings	m_tHaving;		///< post aggregate filtering (got applied only on master)
@@ -3181,6 +3188,9 @@ class ISphQword;
 class ISphQwordSetup;
 class CSphQueryContext;
 struct ISphFilter;
+struct GetKeywordsSettings_t;
+struct SuggestArgs_t;
+struct SuggestResult_t;
 
 
 struct ISphKeywordsStat
@@ -3319,8 +3329,9 @@ public:
 	void						SetCacheSize ( int iMaxCachedDocs, int iMaxCachedHits );
 	virtual bool				MultiQuery ( const CSphQuery * pQuery, CSphQueryResult * pResult, int iSorters, ISphMatchSorter ** ppSorters, const CSphMultiQueryArgs & tArgs ) const = 0;
 	virtual bool				MultiQueryEx ( int iQueries, const CSphQuery * ppQueries, CSphQueryResult ** ppResults, ISphMatchSorter ** ppSorters, const CSphMultiQueryArgs & tArgs ) const = 0;
-	virtual bool				GetKeywords ( CSphVector <CSphKeywordInfo> & dKeywords, const char * szQuery, bool bGetStats, CSphString * pError ) const = 0;
+	virtual bool				GetKeywords ( CSphVector <CSphKeywordInfo> & dKeywords, const char * szQuery, const GetKeywordsSettings_t & tSettings, CSphString * pError ) const = 0;
 	virtual bool				FillKeywords ( CSphVector <CSphKeywordInfo> & dKeywords ) const = 0;
+	virtual void				GetSuggest ( const SuggestArgs_t & , SuggestResult_t & ) const {}
 
 public:
 	/// updates memory-cached attributes in real time
@@ -3504,6 +3515,7 @@ void				sphCollationInit ();
 //////////////////////////////////////////////////////////////////////////
 
 extern CSphString g_sLemmatizerBase;
+extern bool g_bProgressiveMerge;
 
 /////////////////////////////////////////////////////////////////////////////
 

@@ -67,6 +67,7 @@
 %token	TOK_GROUPBY
 %token	TOK_GROUP_CONCAT
 %token	TOK_HAVING
+%token	TOK_HOSTNAMES
 %token	TOK_ID
 %token	TOK_IN
 %token	TOK_INDEX
@@ -192,7 +193,6 @@ request:
 statement:
 	insert_into
 	| delete_from
-	| set_stmt
 	| set_global_stmt
 	| transact_op
 	| call_proc
@@ -219,6 +219,7 @@ statement:
 	| drop_plugin
 	| reload_plugins
 	| reload_index
+	| flush_hostnames
 	;
 
 //////////////////////////////////////////////////////////////////////////
@@ -240,7 +241,7 @@ ident_set:
 	| TOK_COMMITTED | TOK_COUNT | TOK_CREATE | TOK_DATABASES | TOK_DELETE
 	| TOK_DESC | TOK_DESCRIBE  | TOK_DISTINCT  | TOK_DOUBLE | TOK_DROP
 	| TOK_FLOAT | TOK_FLUSH | TOK_FOR| TOK_FUNCTION | TOK_GLOBAL | TOK_GROUP
-	| TOK_GROUP_CONCAT | TOK_GROUPBY | TOK_HAVING  | TOK_INDEX | TOK_INDEXOF | TOK_INSERT
+	| TOK_GROUP_CONCAT | TOK_GROUPBY | TOK_HAVING | TOK_HOSTNAMES | TOK_INDEX | TOK_INDEXOF | TOK_INSERT
 	| TOK_INT | TOK_INTEGER | TOK_INTO | TOK_ISOLATION | TOK_JSON | TOK_LEVEL
 	| TOK_LIKE | TOK_MATCH | TOK_MAX | TOK_META | TOK_MIN | TOK_MULTI
 	| TOK_MULTI64 | TOK_OPTIMIZE | TOK_OPTION | TOK_PLAN | TOK_PLUGIN
@@ -268,6 +269,7 @@ multi_stmt_list:
 multi_stmt:
 	select
 	| show_stmt
+	| set_stmt
 	;
 
 select:
@@ -1540,19 +1542,35 @@ flush_index:
 		}
 	;
 	
+flush_hostnames:
+	TOK_FLUSH TOK_HOSTNAMES
+		{
+			SqlStmt_t & tStmt = *pParser->m_pStmt;
+			tStmt.m_eStmt = STMT_FLUSH_HOSTNAMES;
+		}
+	;	
+	
 //////////////////////////////////////////////////////////////////////////
 
 select_sysvar:
-	TOK_SELECT sysvar_name opt_limit_clause
+	TOK_SELECT sysvar_list opt_limit_clause
 		{
 			pParser->m_pStmt->m_eStmt = STMT_SELECT_SYSVAR;
 			pParser->ToString ( pParser->m_pStmt->m_tQuery.m_sQuery, $2 );
 		}
 	;
-	
+
+sysvar_list:
+	sysvar_item
+	| sysvar_list ',' sysvar_item
+	;
+
+sysvar_item:
+	sysvar_name opt_alias
+	;
+
 sysvar_name:
-	TOK_SYSVAR
-	| TOK_SYSVAR '.' ident
+	TOK_SYSVAR { pParser->AddItem ( &$1 ); }
 	;
 
 select_dual:
@@ -1577,7 +1595,7 @@ truncate:
 //////////////////////////////////////////////////////////////////////////
 
 optimize_index:
-	TOK_OPTIMIZE TOK_INDEX ident
+	TOK_OPTIMIZE TOK_INDEX ident opt_option_clause
 		{
 			SqlStmt_t & tStmt = *pParser->m_pStmt;
 			tStmt.m_eStmt = STMT_OPTIMIZE_INDEX;

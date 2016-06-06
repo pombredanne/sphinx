@@ -23,7 +23,11 @@
 // EXTENDED PARSER RELOADED
 //////////////////////////////////////////////////////////////////////////
 class XQParser_t;
-#include "yysphinxquery.h"
+#ifdef CMAKE_GENERATED_GRAMMAR
+	#include "bissphinxquery.h"
+#else
+	#include "yysphinxquery.h"
+#endif
 
 // #define XQDEBUG 1
 // #define XQ_DUMP_TRANSFORMED_TREE 1
@@ -169,7 +173,12 @@ void yyerror ( XQParser_t * pParser, const char * sMessage )
 #pragma warning(disable:4702) // unreachable code
 #endif
 
-#include "yysphinxquery.c"
+#ifdef CMAKE_GENERATED_GRAMMAR
+	#include "bissphinxquery.c"
+#else
+	#include "yysphinxquery.c"
+#endif
+
 
 #if USE_WINDOWS
 #pragma warning(pop)
@@ -1023,6 +1032,14 @@ int XQParser_t::GetToken ( YYSTYPE * lvalp )
 				if ( sphIsSpace ( m_pTokenizer->GetTokenStart() [ -1 ] ) )
 					continue;
 
+				// right after overshort
+				if ( m_pTokenizer->GetOvershortCount()==1 )
+				{
+					m_iPendingNulls = 0;
+					lvalp->pNode = AddKeyword ( NULL, iSkippedPosBeforeToken );
+					return TOK_KEYWORD;
+				}
+
 				Warning ( "modifiers must be applied to keywords, not operators" );
 
 				// this special is handled in HandleModifiers()
@@ -1594,7 +1611,7 @@ static bool CheckQuorumProximity ( XQNode_t * pNode, CSphString * pError )
 }
 
 
-static void FixupDegenerates ( XQNode_t * pNode )
+static void FixupDegenerates ( XQNode_t * pNode, CSphString & sWarning )
 {
 	if ( !pNode )
 		return;
@@ -1602,12 +1619,15 @@ static void FixupDegenerates ( XQNode_t * pNode )
 	if ( pNode->m_dWords.GetLength()==1 &&
 		( pNode->GetOp()==SPH_QUERY_PHRASE || pNode->GetOp()==SPH_QUERY_PROXIMITY || pNode->GetOp()==SPH_QUERY_QUORUM ) )
 	{
+		if ( pNode->GetOp()==SPH_QUERY_QUORUM && !pNode->m_bPercentOp && pNode->m_iOpArg>1 )
+			sWarning.SetSprintf ( "quorum threshold too high (words=%d, thresh=%d); replacing quorum operator with AND operator", pNode->m_dWords.GetLength(), pNode->m_iOpArg );
+
 		pNode->SetOp ( SPH_QUERY_AND );
 		return;
 	}
 
 	ARRAY_FOREACH ( i, pNode->m_dChildren )
-		FixupDegenerates ( pNode->m_dChildren[i] );
+		FixupDegenerates ( pNode->m_dChildren[i], sWarning );
 }
 
 void XQParser_t::FixupDestForms ()
@@ -1748,7 +1768,7 @@ bool XQParser_t::Parse ( XQQuery_t & tParsed, const char * sQuery, const CSphQue
 	FixupDestForms ();
 	DeleteNodesWOFields ( m_pRoot );
 	m_pRoot = SweepNulls ( m_pRoot );
-	FixupDegenerates ( m_pRoot );
+	FixupDegenerates ( m_pRoot, m_pParsed->m_sParseWarning );
 	FixupNulls ( m_pRoot );
 
 	if ( !FixupNots ( m_pRoot ) )
@@ -4251,18 +4271,18 @@ void CSphTransformation::Dump ()
 	m_hSimilar.IterateStart();
 	while ( m_hSimilar.IterateNext() )
 	{
-		printf ( "\nnode: hash 0x"UINT64_FMT"\n", m_hSimilar.IterateGetKey() );
+		printf ( "\nnode: hash 0x" UINT64_FMT "\n", m_hSimilar.IterateGetKey() );
 		m_hSimilar.IterateGet().IterateStart();
 		while ( m_hSimilar.IterateGet().IterateNext() )
 		{
 			CSphVector<XQNode_t *> & dNodes = m_hSimilar.IterateGet().IterateGet();
-			printf ( "\tgrand: hash 0x"UINT64_FMT", children %d\n", m_hSimilar.IterateGet().IterateGetKey(), dNodes.GetLength() );
+			printf ( "\tgrand: hash 0x" UINT64_FMT ", children %d\n", m_hSimilar.IterateGet().IterateGetKey(), dNodes.GetLength() );
 
 			printf ( "\tparents:\n" );
 			ARRAY_FOREACH ( i, dNodes )
 			{
 				uint64_t uParentHash = dNodes[i]->GetHash();
-				printf ( "\t\thash 0x"UINT64_FMT"\n", uParentHash );
+				printf ( "\t\thash 0x" UINT64_FMT "\n", uParentHash );
 			}
 		}
 	}

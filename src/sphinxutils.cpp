@@ -117,18 +117,21 @@ void sphSplit ( CSphVector<CSphString> & dOut, const char * sIn, const char * sB
 
 		// add the token, skip the char
 		dOut.Add().SetBinary ( sNext, p-sNext );
+		if ( *p=='\0' )
+			break;
+
 		p++;
 	}
 }
 
-
-static bool sphWildcardMatchRec ( const char * sString, const char * sPattern )
+template < typename T1, typename T2 >
+static bool sphWildcardMatchRec ( const T1 * sString, const T2 * sPattern )
 {
 	if ( !sString || !sPattern )
 		return false;
 
-	const char * s = sString;
-	const char * p = sPattern;
+	const T1 * s = sString;
+	const T2 * p = sPattern;
 	while ( *s )
 	{
 		switch ( *p )
@@ -229,13 +232,13 @@ static bool sphWildcardMatchRec ( const char * sString, const char * sPattern )
 		|| ( p[0]=='%' && p[1]=='\0' );
 }
 
-
-static bool sphWildcardMatchDP ( const char * sString, const char * sPattern )
+template < typename T1, typename T2 >
+static bool sphWildcardMatchDP ( const T1 * sString, const T2 * sPattern )
 {
 	assert ( sString && sPattern && *sString && *sPattern );
 
-	const char * s = sString;
-	const char * p = sPattern;
+	const T1 * s = sString;
+	const T2 * p = sPattern;
 	bool bEsc = false;
 	int iEsc = 0;
 
@@ -299,25 +302,51 @@ static bool sphWildcardMatchDP ( const char * sString, const char * sPattern )
 }
 
 
-bool sphWildcardMatch ( const char * sString, const char * sPattern )
+template < typename T1, typename T2 >
+bool sphWildcardMatchSpec ( const T1 * sString, const T2 * sPattern )
 {
-	if ( !sString || !sPattern || !*sString || !*sPattern )
-		return false;
-
+	int iLen = 0;
 	int iStars = 0;
-	const char * p = sPattern;
+	const T2 * p = sPattern;
 	while ( *p )
 	{
 		iStars += ( *p=='*' );
+		iLen++;
 		p++;
 	}
 
-	if ( iStars>10 || ( iStars>5 && strlen ( sString )>17 ) )
+	if ( iStars>10 || ( iStars>5 && iLen>17 ) )
 		return sphWildcardMatchDP ( sString, sPattern );
 	else
 		return sphWildcardMatchRec ( sString, sPattern );
 }
 
+
+bool sphWildcardMatch ( const char * sString, const char * sPattern, const int * pPattern )
+{
+	if ( !sString || !sPattern || !*sString || !*sPattern )
+		return false;
+
+	// there are basically 4 codepaths, because both string and pattern may or may not contain utf-8 chars
+	// pPattern and pString are pointers to unpacked utf-8, pPattern can be precalculated (default is NULL)
+
+	int dString [ SPH_MAX_WORD_LEN + 1 ];
+	const int * pString = ( sphIsUTF8 ( sString ) && sphUTF8ToWideChar ( sString, dString, SPH_MAX_WORD_LEN ) ) ? dString : NULL;
+
+	if ( !pString && !pPattern )
+		return sphWildcardMatchSpec ( sString, sPattern ); // ascii vs ascii
+
+	if ( pString && !pPattern )
+		return sphWildcardMatchSpec ( pString, sPattern ); // utf-8 vs ascii
+
+	if ( !pString && pPattern )
+		return sphWildcardMatchSpec ( sString, pPattern ); // ascii vs utf-8
+
+	if ( pString && pPattern )
+		return sphWildcardMatchSpec ( pString, pPattern ); // utf-8 vs utf-8
+
+	return false;
+}
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -369,7 +398,7 @@ int CSphConfigSection::GetSize ( const char * sKey, int iDefault ) const
 	if ( iSize>INT_MAX )
 	{
 		iSize = INT_MAX;
-		sphWarning ( "'%s = "INT64_FMT"' clamped to %d(INT_MAX)", sKey, iSize, INT_MAX );
+		sphWarning ( "'%s = " INT64_FMT "' clamped to %d(INT_MAX)", sKey, iSize, INT_MAX );
 	}
 	return (int)iSize;
 }
@@ -653,6 +682,7 @@ static KeyDesc_t g_dKeysSearchd[] =
 	{ "qcache_max_bytes",		0, NULL },
 	{ "qcache_thresh_msec",		0, NULL },
 	{ "sphinxql_timeout",		0, NULL },
+	{ "hostname_lookup",		0, NULL },
 	{ NULL,						0, NULL }
 };
 
@@ -668,6 +698,7 @@ static KeyDesc_t g_dKeysCommon[] =
 	{ "rlp_max_batch_size",		0, NULL },
 	{ "rlp_max_batch_docs",		0, NULL },
 	{ "plugin_dir",				0, NULL },
+	{ "progressive_merge",		0, NULL },
 	{ NULL,						0, NULL }
 };
 
@@ -2381,6 +2412,8 @@ void sphConfigureCommon ( const CSphConfig & hConf )
 	g_sLemmatizerBase = hCommon.GetStr ( "lemmatizer_base" );
 	sphConfigureRLP ( hCommon );
 
+	g_bProgressiveMerge = ( hCommon.GetInt ( "progressive_merge", 1 )!=0 );
+
 	bool bJsonStrict = false;
 	bool bJsonAutoconvNumbers = false;
 	bool bJsonKeynamesToLowercase = false;
@@ -2548,6 +2581,52 @@ bool CSphDynamicLibrary::LoadSymbol ( const char *, void ** ) { return false; }
 bool CSphDynamicLibrary::LoadSymbols ( const char **, void ***, int ) { return false; }
 
 #endif
+
+
+void RebalanceWeights ( const CSphFixedVector<int64_t> & dTimers, WORD * pWeights )
+{
+	assert ( dTimers.GetLength () );
+	int64_t iSum = 0;
+	int iCounters = 0;
+	ARRAY_FOREACH ( i, dTimers )
+	{
+		iSum += dTimers[i];
+		iCounters += ( dTimers[i]>0 );
+	}
+
+	// no statistics, all timers bad, keep previous weights
+	if ( iSum<=0 )
+		return;
+
+	// in case of mirror without response still set small probability to it
+	const float fEmptiesPercent = 0.1f;
+	int iEmpties = dTimers.GetLength() - iCounters;
+
+	// balance weights
+	int64_t iCheck = 0;
+	ARRAY_FOREACH ( i, dTimers )
+	{
+		// mirror weight is inverse of timer \ query time
+		float fWeight = 1.0f - (float)dTimers[i] / iSum;
+
+		// subtract coef-empty percent to get sum eq to 1.0
+		if ( iEmpties )
+			fWeight = fWeight - fWeight * fEmptiesPercent;
+
+		// mirror without response
+		if ( !dTimers[i] )
+			fWeight = fEmptiesPercent / iEmpties;
+		else if ( iCounters==1 ) // case when only one mirror has valid counter
+			fWeight = 1.0f - fEmptiesPercent;
+
+		int iWeight = int( fWeight * 65535.0f );
+		assert ( iWeight>=0 && iWeight<=65535 );
+		pWeights[i] = (WORD)iWeight;
+		iCheck += pWeights[i];
+	}
+	assert ( iCheck<=65535 );
+}
+
 
 //
 // $Id$

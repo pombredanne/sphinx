@@ -2247,6 +2247,7 @@ public:
 	T *				Ptr () const				{ return m_pPtr; }
 	CSphScopedPtr &	operator = ( T * pPtr )		{ SafeDelete ( m_pPtr ); m_pPtr = pPtr; return *this; }
 	T *				LeakPtr ()					{ T * pPtr = m_pPtr; m_pPtr = NULL; return pPtr; }
+	void			ReplacePtr ( T * pPtr )		{ m_pPtr = pPtr; }
 	void			Reset ()					{ SafeDelete ( m_pPtr ); }
 
 protected:
@@ -2313,8 +2314,6 @@ protected:
 
 //////////////////////////////////////////////////////////////////////////
 
-// parent process for forked children
-extern bool g_bHeadProcess;
 void sphWarn ( const char *, ... ) __attribute__ ( ( format ( printf, 1, 2 ) ) );
 void SafeClose ( int & iFD );
 
@@ -2426,6 +2425,12 @@ protected:
 
 //////////////////////////////////////////////////////////////////////////
 
+#if !USE_WINDOWS
+#ifndef MADV_DONTFORK
+#define MADV_DONTFORK MADV_NORMAL
+#endif
+#endif
+
 /// in-memory buffer shared between processes
 template < typename T, bool SHARED=false >
 class CSphLargeBuffer : public CSphBufferTrait < T >
@@ -2471,12 +2476,15 @@ public:
 		if ( pData==MAP_FAILED )
 		{
 			if ( iLength>(int64_t)0x7fffffffUL )
-				sError.SetSprintf ( "mmap() failed: %s (length="INT64_FMT" is over 2GB, impossible on some 32-bit systems)",
+				sError.SetSprintf ( "mmap() failed: %s (length=" INT64_FMT " is over 2GB, impossible on some 32-bit systems)",
 					strerror(errno), iLength );
 			else
-				sError.SetSprintf ( "mmap() failed: %s (length="INT64_FMT")", strerror(errno), iLength );
+				sError.SetSprintf ( "mmap() failed: %s (length=" INT64_FMT ")", strerror(errno), iLength );
 			return false;
 		}
+
+		if ( !SHARED )
+			madvise ( pData, iLength, MADV_DONTFORK );
 
 #if SPH_ALLOCS_PROFILER
 		sphMemStatMMapAdd ( iLength );
@@ -2592,7 +2600,7 @@ public:
 			pData = (T *)::MapViewOfFile ( m_iMap, iAccessMode, 0, 0, 0 );
 			if ( !pData )
 			{
-				sError.SetSprintf ( "failed to map file '%s': (errno %d, length="INT64_FMT")", sFile, ::GetLastError(), (int64_t)tLen.QuadPart );
+				sError.SetSprintf ( "failed to map file '%s': (errno %d, length=" INT64_FMT ")", sFile, ::GetLastError(), (int64_t)tLen.QuadPart );
 				Reset();
 				return false;
 			}
@@ -2623,10 +2631,12 @@ public:
 			pData = (T *)mmap ( NULL, iFileSize, iProt, iFlags, iFD, 0 );
 			if ( pData==MAP_FAILED )
 			{
-				sError.SetSprintf ( "failed to mmap file '%s': %s (length="INT64_FMT")", sFile, strerror(errno), iFileSize );
+				sError.SetSprintf ( "failed to mmap file '%s': %s (length=" INT64_FMT ")", sFile, strerror(errno), iFileSize );
 				Reset();
 				return false;
 			}
+
+			madvise ( pData, iFileSize, MADV_DONTFORK );
 		}
 #endif
 
@@ -2827,7 +2837,7 @@ public:
 	CSphRwlock ();
 	~CSphRwlock () {}
 
-	bool Init ();
+	bool Init ( bool bPreferWriter=false );
 	bool Done ();
 
 	bool ReadLock ();
@@ -2907,7 +2917,25 @@ public:
 			SafeDeleteArray ( m_pData );
 	}
 
-	// huh, no copy ctor and operator= ?
+	/// copy ctor
+	CSphBitvec ( const CSphBitvec & rhs )
+	{
+		m_pData = NULL;
+		m_iElements = 0;
+		*this = rhs;
+	}
+
+	/// copy
+	const CSphBitvec & operator = ( const CSphBitvec & rhs )
+	{
+		if ( m_pData!=m_uStatic )
+			SafeDeleteArray ( m_pData );
+
+		Init ( rhs.m_iElements );
+		memcpy ( m_pData, rhs.m_pData, sizeof(m_uStatic[0]) * GetSize() );
+
+		return *this;
+	}
 
 	void Init ( int iElements )
 	{
@@ -3341,6 +3369,124 @@ template<> inline CSphHash<DWORD>::Entry::Entry() : m_Key ( NO_ENTRY ), m_Value 
 template<> inline CSphHash<float>::Entry::Entry() : m_Key ( NO_ENTRY ), m_Value ( 0.0f ) {}
 template<> inline CSphHash<int64_t>::Entry::Entry() : m_Key ( NO_ENTRY ), m_Value ( 0 ) {}
 template<> inline CSphHash<uint64_t>::Entry::Entry() : m_Key ( NO_ENTRY ), m_Value ( 0 ) {}
+
+
+/////////////////////////////////////////////////////////////////////////////
+
+/// generic stateless priority queue
+template < typename T, typename COMP > class CSphQueue
+{
+protected:
+	T *		m_pData;
+	int		m_iUsed;
+	int		m_iSize;
+
+public:
+	/// ctor
+	explicit CSphQueue ( int iSize )
+		: m_pData ( NULL )
+		, m_iUsed ( 0 )
+		, m_iSize ( iSize )
+	{
+		Reset ( iSize );
+	}
+
+	/// dtor
+	~CSphQueue()
+	{
+		SafeDeleteArray ( m_pData );
+	}
+
+	void Reset ( int iSize )
+	{
+		SafeDeleteArray ( m_pData );
+		assert ( iSize>=0 );
+		m_iSize = iSize;
+		m_pData = new T[iSize];
+		assert ( !iSize || m_pData );
+	}
+
+	/// add entry to the queue
+	bool Push ( const T & tEntry )
+	{
+		assert ( m_pData );
+		if ( m_iUsed==m_iSize )
+		{
+			// if it's worse that current min, reject it, else pop off current min
+			if ( COMP::IsLess ( tEntry, m_pData[0] ) )
+				return false;
+			else
+				Pop();
+		}
+
+		// do add
+		m_pData[m_iUsed] = tEntry;
+		int iEntry = m_iUsed++;
+
+		// sift up if needed, so that worst (lesser) ones float to the top
+		while ( iEntry )
+		{
+			int iParent = ( iEntry-1 ) >> 1;
+			if ( !COMP::IsLess ( m_pData[iEntry], m_pData[iParent] ) )
+				break;
+
+			// entry is less than parent, should float to the top
+			Swap ( m_pData[iEntry], m_pData[iParent] );
+			iEntry = iParent;
+		}
+
+		return true;
+	}
+
+	/// remove root (ie. top priority) entry
+	void Pop()
+	{
+		assert ( m_iUsed && m_pData );
+		if ( !( --m_iUsed ) ) // empty queue? just return
+			return;
+
+		// make the last entry my new root
+		m_pData[0] = m_pData[m_iUsed];
+
+		// sift down if needed
+		int iEntry = 0;
+		for ( ;; )
+		{
+			// select child
+			int iChild = ( iEntry<<1 ) + 1;
+			if ( iChild>=m_iUsed )
+				break;
+
+			// select smallest child
+			if ( iChild+1<m_iUsed )
+				if ( COMP::IsLess ( m_pData[iChild+1], m_pData[iChild] ) )
+					iChild++;
+
+			// if smallest child is less than entry, do float it to the top
+			if ( COMP::IsLess ( m_pData[iChild], m_pData[iEntry] ) )
+			{
+				Swap ( m_pData[iChild], m_pData[iEntry] );
+				iEntry = iChild;
+				continue;
+			}
+
+			break;
+		}
+	}
+
+	/// get entries count
+	inline int GetLength () const
+	{
+		return m_iUsed;
+	}
+
+	/// get current root
+	inline const T & Root () const
+	{
+		assert ( m_iUsed && m_pData );
+		return m_pData[0];
+	}
+};
 
 
 #endif // _sphinxstd_

@@ -513,14 +513,23 @@ function GetFirstChildValue ( $node, $name, $default="" )
 	return is_null($child) ? $default : $child->nodeValue;
 }
 
+function ConnectSpecificQL($agent)
+{
+	global $agents;
+
+	$address = $agents[$agent]["address"];
+	$port = $agents[$agent]["sqlport"];
+//	echo "Connecting to agent $address:$port\n";
+	if ($address == "localhost")
+		$address = "127.0.0.1";
+	return @mysqli_connect ( $address, '', '', '', $port );
+}
 
 function ConnectQL()
 {
-	global $sd_address, $sd_sphinxql_port;
-	if ($sd_address == "localhost")
-		$sd_address = "127.0.0.1";
-	return @mysqli_connect ( $sd_address, '', '', '', $sd_sphinxql_port );
+	return ConnectSpecificQL(0);
 }
+
 
 class QLClient
 {
@@ -948,6 +957,19 @@ class SphinxConfig
 		return $result;
 	}
 
+	function SphinxQLAttr ($node)
+	{
+		$len = $node->attributes->length;
+		if ( $len == 0 )
+			return false;
+		$vals = array();
+		foreach( AttrArray( $node ) as $attr )
+		{
+			$vals[$attr->nodeName]=$attr->nodeValue;
+		}
+		return $vals;
+	}
+
 
 	function Load ( $config_file )
 	{
@@ -1047,6 +1069,7 @@ class SphinxConfig
 				$res["filter_value"] = $q->getAttribute("filter_value" );
 				$res["filter_range"] = $this->ParseRange ( $q->getAttribute("filter_range" ) );
 				$res["filter_str"] = $q->getAttribute("filter_str");
+				$res["filter_exclude"] = $q->getAttribute("filter_exclude");
 
 				// parse sort mode and get clause
 				$sortmode = 0;
@@ -1148,6 +1171,7 @@ class SphinxConfig
 			{
 				foreach ( ChildrenArray ( $qs, "sphinxql" ) as $q )
 				{
+					$attrs = $this->SphinxQLAttr($q);
 					$was_replaced = false;
 					foreach ( $metaindexes as $name=>$indexes )
 						foreach ($indexes as $index)
@@ -1157,18 +1181,33 @@ class SphinxConfig
 							if ($foo>0)
 							{
 								$was_replaced = true;
-								foreach ($res as $r)
-									$this->_sphqueries[]=$r;
+								if (!$attrs)
+									foreach ($res as $r)
+										$this->_sphqueries[]=$r;
+								else
+									foreach ($res as $r)
+										$this->_sphqueries[]=array($r,$attrs);
 							}
 						}
 					if (!$was_replaced) // no metaindexes; emit 'as is'
-						foreach ( GetVariants ( $q, $doc->encoding ) as $r)
-							$this->_sphqueries[]=$r;
+					{
+						if (!$attrs)
+							foreach ( GetVariants ( $q, $doc->encoding ) as $r)
+								$this->_sphqueries[]=$r;
+						else
+							foreach ( GetVariants ( $q, $doc->encoding ) as $r)
+								$this->_sphqueries[]=array($r,$attrs);
+					}
 				}
 			} else
 			{
-				foreach ( ChildrenArray ( $qs, "sphinxql" ) as $q )
-					$this->_sphqueries[] = iconv ( 'utf-8', $doc->encoding, $q->nodeValue );
+				foreach ( ChildrenArray ( $qs, "sphinxql" ) as $q ) {
+					$attrs = $this->SphinxQLAttr($q);
+					if (!$attrs)
+						$this->_sphqueries[] = iconv('utf-8', $doc->encoding, $q->nodeValue);
+					else
+						$this->_sphqueries[] = array(iconv('utf-8', $doc->encoding, $q->nodeValue),$attrs);
+				}
 			}
 		}
 
@@ -1247,11 +1286,13 @@ class SphinxConfig
 		$qcount = count($this->_sphqueries);
 		if ( $bench === true )
 			$qcount *= 2;
-		if (!($connection = ConnectQL()))
-			return false;
 
+		$connection=false;
 		$qmin = 0;
 		$qmax = $qcount - 1;
+		$old_agent = -1;
+		$use_agent = 0;
+		$sleep_agent=0;
 		if ( $g_pick_query>0 )
 		{
 			$qmin = $g_pick_query-1;
@@ -1269,11 +1310,34 @@ class SphinxConfig
 				else
 					$query = 'show meta';
 			}
+			$sleep_agent=0;
+			$use_agent=0;
+			if (is_array($query))
+			{
+				foreach ( $query[1] as $k => $v )
+				{
+					if ($k=="d")
+						$use_agent = $v;
+					elseif ($k=="sleep")
+						$sleep_agent = $v;
+				}
+				$query = $query[0];
+			}
+
+			if ($old_agent!=$use_agent) {
+				if ($old_agent!=-1)
+					mysqli_close($connection);
+				if ($sleep_agent>0)
+					usleep($sleep_agent);
+				if (!($connection = ConnectSpecificQL($use_agent)))
+					return false;
+				$old_agent = $use_agent;
+			}
 
 			if ( $query=="RECONNECT" )
 			{
 				mysqli_close($connection);
-				if (!($connection = ConnectQL()))
+				if (!($connection = ConnectSpecificQL($use_agent)))
 					return false;
 
 				$r = array("sphinxql"=>$query, "error"=>"reconnected ok!", "errno"=>0);
@@ -1353,6 +1417,7 @@ class SphinxConfig
 						{
 							$this->_results_model[$this->SubtestNo ()][] = $query_result;
 						}
+						$query_result = array ();
 					} while (mysqli_next_result($connection));
 				} else
 				{
@@ -1467,14 +1532,17 @@ class SphinxConfig
 						if ( @$qinfo["filter"] )
 						{
 							$name = $qinfo["filter"];
+							$exclude = false;
+							if ( isset ( $qinfo["filter_exclude"] ) && $qinfo["filter_exclude"]=="1" )
+								$exclude = true;
 							if ( @$qinfo["filter_value"] )
-								$cl->SetFilter ( $name, array ( $qinfo["filter_value"] ) );
+								$cl->SetFilter ( $name, array ( $qinfo["filter_value"] ), $exclude );
 							elseif ( @$qinfo["filter_range"] )
 							{
 								$range = $qinfo["filter_range"];
-								$cl->SetFilterRange ( $name, $range['min'], $range['max'] );
+								$cl->SetFilterRange ( $name, $range['min'], $range['max'], $exclude );
 							} elseif ( @$qinfo["filter_str"] )
-								$cl->SetFilterString ( $name, $qinfo["filter_str"] );
+								$cl->SetFilterString ( $name, $qinfo["filter_str"], $exclude );
 						}
 						
 						$results = $cl->Query ( $query, $my_index, "run".(1+$this->SubtestNo()) );
@@ -2653,10 +2721,24 @@ class SphinxConfig
 			case "agent_address":
 			case "agent1_address":		fwrite ( $fp, $agents[1]["address"].":".$agents[1]["port"] ); return;
 			case "agent2_address":		fwrite ( $fp, $agents[2]["address"].":".$agents[2]["port"] ); return;
-			case "data_path":			fwrite ( $fp, $index_data_path ); return;
+
 			case "local":				fwrite ( $fp, $this->GetLocal ( $node->nodeValue ) ); return;
 			case "test_root":			fwrite ( $fp, dirname(__FILE__) ); return;
 			case "this_test":			fwrite ( $fp, $this->_testdir ); return;
+			case "data_path": {
+				$subdir = GetfirstAttr($node);
+				if ($subdir==NULL) {
+					fwrite($fp, $index_data_path);
+					return;
+				}
+				$path = "$index_data_path/$subdir->nodeValue";
+				if ( !file_exists ( $path ) )
+					mkdir ( $path );
+				EraseDirContents($path);
+				fwrite($fp, $path);
+				return;
+			}
+
 		}
 		
 		if ( $nodename=="variant" )
@@ -2711,7 +2793,8 @@ function EraseDirContents ( $path )
 	{
 		while ( ( $file = readdir ( $fp ) ) !== false )
 		{ 
-		if ( $file!="." && $file!=".." && !is_dir ( $file ) && $file!="stub.txt" )
+		if ( $file!="." && $file!=".." && $file!="stub.txt" )
+			if (!is_dir("$path/$file"))
 				unlink ( "$path/$file" ); 
 		} 
 
@@ -2998,10 +3081,10 @@ function RunTest ( $test_dir, $skipdemo, $usemarks )
 				if ( !$config->WriteConfig ( $config_file, $i, $msg ) )
 					continue;
 
-			if ( $sd_managed_searchd )
-				$searchd_ret = 0;
-			else
-				$searchd_ret = StartSearchd ( $config_file, "error_".$agent_id.".txt", $pid_file, $error, $config->Requires ( "watchdog" ), $config->AddressAPI(), $config->Port() );
+                if ( $sd_managed_searchd )
+                    $searchd_ret = 0;
+                else
+                    $searchd_ret = StartSearchd ( $config_file, "error_".$agent_id.".txt", $pid_file, $error, $config->Requires ( "watchdog" ), $config->AddressAPI(), $config->Port() );
 
 				if ( $searchd_ret == 1 )
 				{
